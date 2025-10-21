@@ -1,0 +1,16 @@
+{
+  "servers": [
+    {
+      "name": "Main Server (Local)",
+      "host": "local",
+      "user": "local",
+      "auth_method": "none"
+    },
+    {
+      "name": "Additional Server",
+      "host": "ip-address",
+      "user": "usernamet",
+      "auth_method": "password"
+    }
+  ]
+}

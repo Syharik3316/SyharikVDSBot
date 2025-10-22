@@ -9,8 +9,9 @@
     {
       "name": "Additional Server",
       "host": "ip-address",
-      "user": "usernamet",
+      "user": "username",
       "auth_method": "password"
     }
   ]
+
 }

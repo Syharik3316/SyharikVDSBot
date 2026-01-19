@@ -1,4 +1,3 @@
-
 import telebot
 import psutil
 import os
@@ -11,8 +10,8 @@ import shutil
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # --- ГЛОБАЛЬНЫЕ НАСТРОЙКИ ---
-BOT_TOKEN = 'BOT_TOKEN_HERE'
-AUTHORIZED_USER_IDS = [USERIDHERE]
+BOT_TOKEN = '7467238916:AAEO4R6TpkAG_NgtE1m8Leg07Hus1NhIjk4'
+AUTHORIZED_USER_IDS = [1395583348]
 CONFIG_FILE = 'config.json'
 
 # --- НАСТРОЙКИ МОНИТОРИНГА (для локального сервера) ---
@@ -21,6 +20,10 @@ CPU_THRESHOLD = 90.0
 RAM_THRESHOLD = 90.0
 DISK_THRESHOLD = 85.0
 MONITORING_INTERVAL = 60
+
+# --- Доп. информация в /status ---
+# Показывать статистику fail2ban по jail `sshd` (всего + за последние 24 часа)
+FAIL2BAN_STATUS_ENABLED = True
 
 # --- Глобальные переменные ---
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -76,33 +79,54 @@ def execute_ssh_command(command, server, chat_id, message_id, user_id):
     try:
         bot.edit_message_text(f"Выполняю на *{server['name']}*: `{command}`", chat_id, message_id, parse_mode="Markdown")
         
+        exit_code = 0
         if server.get('host') == 'local':
             import subprocess
             process = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=120)
             output, error = process.stdout, process.stderr
+            exit_code = process.returncode
         else:
             ssh = get_ssh_connection(server, user_id)
             stdin, stdout, stderr = ssh.exec_command(command, timeout=120)
             output = stdout.read().decode('utf-8', 'ignore')
             error = stderr.read().decode('utf-8', 'ignore')
+            # Получаем код возврата команды
+            exit_code = stdout.channel.recv_exit_status()
             ssh.close()
 
-        header = f"✅ *Результат с {server['name']}:* `{command}`\n\n"
-        full_log = ""
-        if output: full_log += f"--- ВЫВОД ---\n{output.strip()}"
-        if error: full_log += f"\n\n--- ОШИБКИ ---\n{error.strip()}"
-        if not full_log.strip(): full_log = "_Команда выполнена без вывода._"
+        is_update_cmd = "apt update" in command and "apt upgrade" in command
 
-        response = header
-        if len(header) + len(full_log) < 4096:
-            if output or error: response += f"```\n{full_log}\n```"
-            else: response += full_log
+        if is_update_cmd:
+            # Для тяжёлой команды обновления показываем только итог
+            if exit_code == 0 and not error:
+                response = f"✅ Обновление на *{server['name']}* завершено успешно."
+            else:
+                # Кратко покажем ошибку/ключевую информацию, но без полного лога
+                details = (error or output or "Неизвестная ошибка").strip()
+                if len(details) > 1500:
+                    details = details[:1500] + "\n... (сообщение сокращено)"
+                response = (
+                    f"❌ Обновление на *{server['name']}* завершилось с ошибкой (код {exit_code}).\n\n"
+                    f"```{details}```"
+                )
+            bot.edit_message_text(response, chat_id, message_id, parse_mode="Markdown", disable_web_page_preview=True)
         else:
-            available_space = 4096 - len(header) - 50
-            truncated_log = full_log[:available_space]
-            response += f"```\n{truncated_log}\n```\n... (ответ был сокращен)"
-        
-        bot.edit_message_text(response, chat_id, message_id, parse_mode="Markdown", disable_web_page_preview=True)
+            header = f"✅ *Результат с {server['name']}:* `{command}`\n\n"
+            full_log = ""
+            if output: full_log += f"--- ВЫВОД ---\n{output.strip()}"
+            if error: full_log += f"\n\n--- ОШИБКИ ---\n{error.strip()}"
+            if not full_log.strip(): full_log = "_Команда выполнена без вывода._"
+            
+            response = header
+            if len(header) + len(full_log) < 4096:
+                if output or error: response += f"```\n{full_log}\n```"
+                else: response += full_log
+            else:
+                available_space = 4096 - len(header) - 50
+                truncated_log = full_log[:available_space]
+                response += f"```\n{truncated_log}\n```\n... (ответ был сокращен)"
+            
+            bot.edit_message_text(response, chat_id, message_id, parse_mode="Markdown", disable_web_page_preview=True)
 
     except Exception as e:
         error_text = f"❌ Ошибка на *{server['name']}*:\n```\n{str(e)}\n```"
@@ -167,10 +191,141 @@ def get_remote_status(server, chat_id, message_id, user_id):
         
         cpu, ram, disk = output.split('--')
         status_message = f"*Статус {server['name']}:*\n\n`ЦПУ:` {cpu.strip()}%\n`ОЗУ:` {ram.strip()}%\n`Диск:` {disk.strip()}"
+        if FAIL2BAN_STATUS_ENABLED:
+            fail2ban_block = get_fail2ban_status_block(server, user_id)
+            status_message += "\n\n" + (fail2ban_block or "_Fail2ban (sshd): недоступен (нет fail2ban-client и/или /var/log/fail2ban.log)_")
         bot.edit_message_text(status_message, chat_id, message_id, parse_mode="Markdown")
     except Exception as e:
         bot.edit_message_text(f"❌ Не удалось получить статус с *{server['name']}*:\n```{e}```", chat_id, message_id, parse_mode="Markdown")
 
+
+def _parse_fail2ban_client_status(text: str):
+    """
+    Парсит вывод `fail2ban-client status sshd`.
+    Возвращает dict с ключами: currently_banned, total_banned, total_failed (int|None)
+    """
+    result = {"currently_banned": None, "total_banned": None, "total_failed": None}
+    if not text:
+        return result
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        # Убираем префиксы типа "|- ", "|  |- ", "`- " и т.п. из вывода fail2ban-client
+        while line and line[0] in ("|", "-", "`", " "):
+            line = line[1:]
+        line = line.strip()
+        if ":" not in line:
+            continue
+        key, value = [p.strip() for p in line.split(":", 1)]
+        if key == "Currently banned":
+            try: result["currently_banned"] = int(value)
+            except ValueError: pass
+        elif key == "Total banned":
+            try: result["total_banned"] = int(value)
+            except ValueError: pass
+        elif key == "Total failed":
+            try: result["total_failed"] = int(value)
+            except ValueError: pass
+    return result
+
+
+def get_fail2ban_status_block(server, user_id):
+    """
+    Возвращает Markdown-блок со статистикой fail2ban (jail sshd) или '' если недоступно.
+    - Всего: currently_banned / total_banned / total_failed (из fail2ban-client)
+    - За 24 часа: banned_24h / attempts_24h (из /var/log/fail2ban.log)
+    """
+    jail = "sshd"
+    try:
+        if server.get("host") == "local":
+            import subprocess
+            # totals
+            p1 = subprocess.run(
+                f"fail2ban-client status {jail}",
+                shell=True, capture_output=True, text=True, timeout=10
+            )
+            totals_out = (p1.stdout or "") + ("\n" + p1.stderr if p1.stderr else "")
+
+            # 24h from log
+            p2 = subprocess.run(
+                "bash -lc \""
+                "since=$(date -d '24 hours ago' '+%Y-%m-%d %H:%M:%S'); "
+                "if [ -f /var/log/fail2ban.log ]; then "
+                "awk -v since=\\\"$since\\\" '"
+                "{ts=substr($0,1,19)} "
+                "$0 ~ /\\[sshd\\]/ && ts>=since { "
+                "if ($0 ~ /fail2ban\\.actions/ && $0 ~ /Ban /) b++; "
+                "if ($0 ~ /fail2ban\\.filter/ && $0 ~ /Found/) f++; "
+                "} "
+                "END{print (b+0) \" \" (f+0)}' /var/log/fail2ban.log; "
+                "else echo 'NA NA'; fi\"",
+                shell=True, capture_output=True, text=True, timeout=10
+            )
+            last24 = (p2.stdout or "").strip()
+        else:
+            ssh = get_ssh_connection(server, user_id)
+            # totals
+            stdin, stdout, stderr = ssh.exec_command(f"fail2ban-client status {jail}", timeout=15)
+            totals_out = stdout.read().decode("utf-8", "ignore")
+            totals_err = stderr.read().decode("utf-8", "ignore")
+            if totals_err and not totals_out:
+                totals_out = totals_err
+
+            # 24h from log (single command)
+            cmd_24h = (
+                "bash -lc \""
+                "since=$(date -d '24 hours ago' '+%Y-%m-%d %H:%M:%S'); "
+                "if [ -f /var/log/fail2ban.log ]; then "
+                "awk -v since=\\\"$since\\\" '"
+                "{ts=substr($0,1,19)} "
+                "$0 ~ /\\[sshd\\]/ && ts>=since { "
+                "if ($0 ~ /fail2ban\\.actions/ && $0 ~ /Ban /) b++; "
+                "if ($0 ~ /fail2ban\\.filter/ && $0 ~ /Found/) f++; "
+                "} "
+                "END{print (b+0) \" \" (f+0)}' /var/log/fail2ban.log; "
+                "else echo 'NA NA'; fi\""
+            )
+            stdin, stdout, stderr = ssh.exec_command(cmd_24h, timeout=15)
+            last24 = stdout.read().decode("utf-8", "ignore").strip()
+            ssh.close()
+
+        totals = _parse_fail2ban_client_status(totals_out)
+
+        banned_24h = None
+        attempts_24h = None
+        if last24:
+            parts = last24.split()
+            if len(parts) >= 2 and parts[0] != "NA":
+                try: banned_24h = int(parts[0])
+                except ValueError: banned_24h = None
+                try: attempts_24h = int(parts[1])
+                except ValueError: attempts_24h = None
+
+        # Если вообще ничего не удалось получить — не показываем блок
+        if all(v is None for v in totals.values()) and banned_24h is None and attempts_24h is None:
+            return ""
+
+        lines = ["*Fail2ban (jail `sshd`):*"]
+        # Всего
+        if any(v is not None for v in totals.values()):
+            lines.append(
+                "`Всего:` "
+                f"сейчас в бане: {totals['currently_banned'] if totals['currently_banned'] is not None else '—'} | "
+                f"банов всего: {totals['total_banned'] if totals['total_banned'] is not None else '—'} | "
+                f"попыток всего: {totals['total_failed'] if totals['total_failed'] is not None else '—'}"
+            )
+
+        # 24 часа
+        if banned_24h is not None or attempts_24h is not None:
+            lines.append(
+                "`За 24ч:` "
+                f"банов: {banned_24h if banned_24h is not None else '—'} | "
+                f"попыток: {attempts_24h if attempts_24h is not None else '—'}"
+            )
+
+        return "\n".join(lines)
+    except Exception:
+        # fail2ban необязателен — тихо скрываем, чтобы /status работал всегда
+        return ""
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
 
@@ -205,7 +360,7 @@ def send_help(message):
         "*/logs, /l <путь> [строк]* - Показать лог-файл\n"
         "*/download, /d <путь>* - Скачать файл с сервера\n"
         "*/upload, /up <путь>* - Загрузить файл в указанную папку\n"
-        "*/update, /u* - Выполнить `apt update && apt upgrade -y`\n"
+        "*/update, /u* - Выполнить обновление сервера\n"
         "*/reboot, /r* - Перезагрузить сервер\n"
         "*/netstat, /ns* - Показать активные порты (`netstat -tuln`)\n\n"
         f"*Мониторинг:* {'включен' if MONITORING_ENABLED else 'выключен'}. Бот следит за состоянием *локального* сервера."
@@ -264,7 +419,7 @@ def command_upload_prepare(message):
 @bot.message_handler(commands=['update', 'u'])
 def command_update(message):
     if not is_authorized(message.from_user.id): return
-    cmd = 'apt update && apt upgrade -y'
+    cmd = 'apt update && apt-get dist-upgrade -y'
     ask_for_server(message.chat.id, 'exec', 'Выполнить полное обновление системы?', payload=cmd)
 
 @bot.message_handler(commands=['reboot', 'r'])
@@ -294,7 +449,11 @@ def process_action(user_id, chat_id, message_id):
     if action_type == 'status':
         if server.get('host') == 'local':
             disk = psutil.disk_usage('/'); cpu = psutil.cpu_percent(1); ram = psutil.virtual_memory()
-            bot.edit_message_text(f"*Статус {server['name']}:*\n\n`ЦПУ:` {cpu}%\n`ОЗУ:` {ram.percent}%\n`Диск:` {disk.percent}%", chat_id, message_id, parse_mode="Markdown")
+            status_message = f"*Статус {server['name']}:*\n\n`ЦПУ:` {cpu}%\n`ОЗУ:` {ram.percent}%\n`Диск:` {disk.percent}%"
+            if FAIL2BAN_STATUS_ENABLED:
+                fail2ban_block = get_fail2ban_status_block(server, user_id)
+                status_message += "\n\n" + (fail2ban_block or "_Fail2ban (sshd): недоступен (нет fail2ban-client и/или /var/log/fail2ban.log)_")
+            bot.edit_message_text(status_message, chat_id, message_id, parse_mode="Markdown")
         else:
             get_remote_status(server, chat_id, message_id, user_id)
     

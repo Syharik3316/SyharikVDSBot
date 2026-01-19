@@ -49,6 +49,8 @@ AUTHORIZED_USER_IDS = [Ввести ID пользователей-админис
 
 CONFIG_FILE = 'config.json' - при необходимости смените название.
 
+FAIL2BAN_STATUS_ENABLED = True/False - Показывать статистику fail2ban по jail `sshd' (jail меняется в коде)
+
 MONITORING_ENABLED = True/False (включить мониторинг или нет)
 
 CPU_THRESHOLD = 90.0 (процент заполненности для срабатывания варнинга)

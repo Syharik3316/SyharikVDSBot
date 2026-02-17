@@ -10,8 +10,8 @@ import shutil
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # --- ГЛОБАЛЬНЫЕ НАСТРОЙКИ ---
-BOT_TOKEN = '7467238916:AAEO4R6TpkAG_NgtE1m8Leg07Hus1NhIjk4'
-AUTHORIZED_USER_IDS = [1395583348]
+BOT_TOKEN = ''
+AUTHORIZED_USER_IDS = []
 CONFIG_FILE = 'config.json'
 
 # --- НАСТРОЙКИ МОНИТОРИНГА (для локального сервера) ---
@@ -585,4 +585,5 @@ if __name__ == '__main__':
         bot.polling(none_stop=True, interval=0)
     else:
         print("Бот не может быть запущен из-за ошибки конфигурации.")
+
 
